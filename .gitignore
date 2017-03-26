@@ -1,5 +1,10 @@
 *.class
 *.log
+.idea/
+out/
+project/
+lib/
+res/
 
 # sbt specific
 .cache
