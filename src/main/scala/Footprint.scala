@@ -19,7 +19,7 @@ object Footprint {
 
     // deleteFile(new File(output))
 
-    val conf = new SparkConf().setAppName("CrossMatch").setMaster("spark://ip:7077").setSparkHome(System.getenv("SPARK_HOME"))
+    val conf = new SparkConf().setAppName("CrossMatch").setMaster("local").setSparkHome(System.getenv("SPARK_HOME"))
     val sc = new SparkContext(conf)
 
     //    val data2MASS = sc.textFile(file2MASS).map(dataImporter)
@@ -35,6 +35,7 @@ object Footprint {
       if (firstRound.value) {
         // 把读入文件的过程应该放进循环里比较好吧？
         val data2MASS = sc.textFile(file2MASS).map(dataImporter)
+
         /*
         * HealPix分解成 上一级高位High+本级低位Low 形式
         * ((281,1),(0.3601450701050618,1.5874289965420452))
@@ -56,6 +57,7 @@ object Footprint {
         }
       }
 
+      twoOrderData.saveAsTextFile(output)
       /*
     * 去重，方便后面统计低位个数（00、01、10、11）
     * todo:直接对healpix去重不得了？？？
