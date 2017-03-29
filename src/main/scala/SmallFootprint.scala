@@ -65,9 +65,9 @@ object SmallFootprint {
 
 
       // 当前选出的数据还不能直接拿出去，还得和下一次比对
-      pickupDataFilter.foreach(println)
+      pickupData.foreach(println)
       println("----------")
-      keepDataFilter.foreach(println)
+      keepData.foreach(println)
       println("==========")
 
 
@@ -75,8 +75,12 @@ object SmallFootprint {
       //
       //      iterativeData = highOrderData.subtractByKey(pickupDataFilter) // 用subtractByKey可以直接筛出去
       //
-      //      if (i == 0)
-      //        iterativeData.map(v => ((v._1, i), v._2)).saveAsTextFile(output + i)
+      if (i == 0)
+        {
+          keepData.foreach(println)
+          println(keepData.count)
+        }
+      //              iterativeData.map(v => ((v._1, i), v._2)).saveAsTextFile(output + i)
 
     }
     /**
