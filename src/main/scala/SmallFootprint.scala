@@ -1,5 +1,4 @@
 import java.io.File
-
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
 
@@ -9,31 +8,29 @@ import org.apache.spark.rdd.RDD
 object SmallFootprint {
 
   val N_side: Int = 2
-
+  // TO*DO:先分区 在分区数取余
+  // TODO:每个 lowOrder 统计
   def main(args: Array[String]): Unit = {
     val fileSmallData = "./res/smallData.txt"
 
     val output = "./res/footprint/"
-
+    // TODO: DataFrame能不能优化数据结构？http://blog.csdn.net/lw_ghy/article/details/51480358
 
     deleteFile(new File(output))
 
     val conf = new SparkConf().setAppName("CrossMatch").setMaster("local").setSparkHome(System.getenv("SPARK_HOME"))
     val sc = new SparkContext(conf)
 
-    val smallData = sc.textFile(fileSmallData).map(dataImporter)
-
-    //    val data2MASS = sc.textFile(file2MASS).map(dataImporter)
-    //    val dataSDSS = sc.textFile(fileSDSS).map(dataImporter)
-
-    var firstRound = sc.broadcast(true)
+    // 标上ID，替换掉多余的坐标信息，减少内存占用
+    val smallData = sc.textFile(fileSmallData).map(dataImporter).zipWithIndex()
+    // zipWithIndex全局有序（费时），zipWithUniqueId无序（只保证ID唯一）
+    // smallData.zipWithIndex().saveAsTextFile(output + "1")
+    // smallData.zipWithUniqueId().saveAsTextFile(output + "2")
 
     // 反复操作的数据
     var iterativeData = smallData.map {
-      case (healpixId, (ra, dec)) => (healpixId, (false, (healpixId, ra, dec)))
+      case ((healpixId, coordinate), id) => healpixId -> (healpixId, id)
     }
-    // Boolean如果为true证明可以继续聚合，false表示不再聚合
-    var tempData: RDD[((Long, Int), (Boolean, (Long, Double, Double)))] = null
 
     for (i <- Array(1, 0)) {
       // 分出高低order
@@ -41,7 +38,6 @@ object SmallFootprint {
         case (healpixId, others) => (twoOrder(healpixId, i), others)
       }
       // 对(highOrder, lowOrder)去重
-      // TODO: 还不行，还得换回来。。
       val distinctData = twoOrderData.reduceByKey((v1, _) => v1)
 
       // 将相同highOrder的lowOrders放在一起
@@ -56,12 +52,12 @@ object SmallFootprint {
       val keepDataFilter = highOrderSingleData.filter(_._2.size == 4)
       // 将highOrder作为key，去除lowOrder信息（应该没用了），其他信息作为value
       val highOrderData = twoOrderData.map {
-        case ((highOrder, _), (aggregateOrNot, otherInfo)) => highOrder -> (aggregateOrNot, otherInfo)
+        case ((highOrder, _), otherInfo) => (highOrder, otherInfo)
       }
 
-      val pickupData = highOrderData.subtractByKey(keepDataFilter).map(v => ((v._1, i + 1), v._2))
-      val keepData = highOrderData.subtractByKey(pickupDataFilter).map(v => ((v._1, i + 1), v._2))
-      tempData = keepData
+      val pickupData = highOrderData.subtractByKey(keepDataFilter)
+      val keepData = highOrderData.subtractByKey(pickupDataFilter)
+      iterativeData = keepData
 
 
       // 当前选出的数据还不能直接拿出去，还得和下一次比对
@@ -75,11 +71,10 @@ object SmallFootprint {
       //
       //      iterativeData = highOrderData.subtractByKey(pickupDataFilter) // 用subtractByKey可以直接筛出去
       //
-      if (i == 0)
-        {
-          keepData.foreach(println)
-          println(keepData.count)
-        }
+      if (i == 0) {
+        keepData.foreach(println)
+        println(keepData.count)
+      }
       //              iterativeData.map(v => ((v._1, i), v._2)).saveAsTextFile(output + i)
 
     }
@@ -120,26 +115,39 @@ object SmallFootprint {
   }
 
 
-  // 给一个order序列，生成id对应的order集合
-  def highOrder(id: Long, order: Int, highestOrder: Int = N_side): Long = id >> (highestOrder - order) * 2
+  /** @return 高位 */
+  def highOrder(id: Long, order: Int, highestOrder: Int = N_side): Long = {
+    id >> (highestOrder - order) * 2
+  }
 
-  //  def lowOrder(id: Long, order: Int, highestOrder: Int = N_side): Long = (id >> (highestOrder - order) * 2) & 0x3
-  def lowOrder(id: Long, order: Int, highestOrder: Int = N_side): Long = (id >> (highestOrder - order - 1) * 2) & 0x3
+  /** @return 低两位(00,01,10,11) */
+  def lowOrder(id: Long, order: Int, highestOrder: Int = N_side): Long = {
+    (id >> (highestOrder - order - 1) * 2) & 0x3
+  }
 
+  /** @return (高位,低位) */
   def twoOrder(id: Long, order: Int, highestOrder: Int = N_side): (Long, Byte) = {
-    // val highOrder = id >> (highestOrder - order) * 2
     (id >> (highestOrder - order) * 2, (id >> (highestOrder - order - 1) * 2 & 0x3).toByte)
   }
 
-  def toOrders(array: Array[Int], id: Long): Array[Long] = for (i <- array) yield highOrder(id, i)
+  /** @return 返回给定array序列中的每一层号 */
+  def toOrders(array: Array[Int], id: Long): Array[Long] = {
+    for (i <- array) yield highOrder(id, i)
+  }
 
-
-  class HealpixPartitioner(partitions: Long, k_Healpix: Int) extends Partitioner {
-    override def numPartitions: Int = partitions.toInt
+  // 仿照 org.apache.spark..Partitioner.HashPartitioner 编写
+  class HealpixPartitioner(partitions: Int, order: Int, highestOrder: Int = N_side) extends Partitioner {
+    override def numPartitions: Int = partitions
 
     override def getPartition(key: Any): Int = key match {
-      case k: Long => (k >> k_Healpix * 2).toInt
+      // TODO:直接用分区数分区行么？用不用hashCode？
+      case id: Long => highOrder(id, order, highestOrder).toInt % numPartitions
+      case null => 0
     }
+
+    /*    public int getPartition(K2 key, V2 value, int numReduceTasks) {
+          return (key.hashCode() & 2147483647) % numReduceTasks;
+        }*/
   }
 
 }
