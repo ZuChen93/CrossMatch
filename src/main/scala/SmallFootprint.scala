@@ -6,106 +6,91 @@ import org.apache.spark._
   * Created by Chen on 2017/3/5 0005.
   */
 object SmallFootprint {
-
+  /** 参数调整 */
   val N_side: Int = 2
+  val aggregatedProvider = Array(0, 1)
+  val fileSmallData = "./res/smallData.txt"
+  val output = "./res/footprint/"
 
-  // TO*DO:先分区 在分区数取余
-  // TODO:每个 lowOrder 统计
   def main(args: Array[String]): Unit = {
-    val fileSmallData = "./res/smallData.txt"
 
-    val output = "./res/footprint/"
-    // TODO: DataFrame能不能优化数据结构？http://blog.csdn.net/lw_ghy/article/details/51480358
+    // TODO:能不能用DataFrame优化数据结构？http://blog.csdn.net/lw_ghy/article/details/51480358
 
     deleteFile(new File(output))
 
     val conf = new SparkConf().setAppName("CrossMatch").setMaster("local").setSparkHome(System.getenv("SPARK_HOME"))
     val sc = new SparkContext(conf)
 
-    // 标上ID，替换掉多余的坐标信息，减少内存占用
-    /** @note 两种编号方法：zipWithIndex全局有序（费时），zipWithUniqueId全局无序（只保证ID唯一）
-      * smallData.zipWithUniqueId().saveAsTextFile(output + "2") */
-    val smallData = sc.textFile(fileSmallData).map(dataImporter).zipWithUniqueId()
-    smallData.foreach(println)
-    println("***********")
 
-    // 反复操作的数据，开始就把id转化为List格式，方便后面迭代
+    /** @return 标上ID（区别于HealPixID），替换掉多余的坐标信息，减少内存占用
+      * @note 两种编号方法：zipWithIndex全局有序（费时），zipWithUniqueId全局无序（只保证ID唯一）
+      *       smallData.zipWithUniqueId().saveAsTextFile(output + "2") */
+    val smallData = sc.textFile(fileSmallData).map(dataImporter).zipWithUniqueId()
+
+    /** @return 反复操作的数据，开始就把id转化为List格式，方便后面迭代
+      *         (healpixId, (N_side, List(id)) */
     var iterativeData = smallData.map {
-      case ((healpixId, coordinate), id) => healpixId -> List(id)
+      case ((healpixId, coordinate), id) => healpixId -> (N_side, List(id))
     }
 
-    for (i <- Array(1, 0)) {
-      /** @return highOrder -> (lowOrder, id) */
+    for (i <- aggregatedProvider.reverse) {
+      /** @return (highOrder, (lowOrder, currentHighestOrder, id)) */
       val twoOrderData = iterativeData.map {
-        case (healpixId, id) => highOrder(healpixId, i) -> (lowOrder(healpixId, i), id)
+        // TODO: 因为每一次迭代中的highestOrder都不一样，所以需要每次变化
+        case (healpixId, (currentHighestOrder, id)) =>
+          highOrder(healpixId, i, currentHighestOrder) -> (currentHighestOrder, lowOrder(healpixId, i, currentHighestOrder), id)
       }
 
-      /** @note 此结果只是统计每个lowOrder个数，考虑多层List嵌套会浪费空间（一个大List里面有四个小List）
+      /** @note 核心！此结果只是统计每个lowOrder个数，考虑多层List嵌套会浪费空间（一个大List里面有四个小List）
         *       没有将对应的HEALPixID归类，只是聚成有一个集合，如果后期聚合可以根据lowOrder重进计算筛选
-        *       createCombiner操作：创建一个4元素数组，根据lowOrder对应的位置初始单位1；保留List(ID)格式
-        *       mergeValue操作：    两个数组对应元素相加；List(ID)相加
+        *       createCombiner操作：创建一个4元素数组，根据lowOrder对应的位置初始单位1；保留List(ID)格式和currentHighestOrder
+        *       mergeValue操作：    两个数组对应元素相加；List(ID)相加；currentHighestOrder不变
         *       mergeCombiners操作：合并结果
+        * @return 最后生成lowOrderArray，表示当前highOrder下lowOrder的分布，后面跟上同级的所有ID
         * @example (0, List(8, 4, 3, 4), List(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 49, 50, 51, 52, 53, 54, 55, 57, 58))
-        *          (4, List(4, 2, 0, 0), List(43, 44, 45, 46, 47, 48))
-        */
-      val combineLowOrder = twoOrderData.combineByKey[(Array[Int], List[Long])](
-        (v: (Byte, List[Long])) => {
+        *          (4, List(4, 2, 0, 0), List(43, 44, 45, 46, 47, 48)) */
+      val combineLowOrder = twoOrderData.combineByKey[(Int, Array[Int], List[Long])](
+        (c: (Int, Byte, List[Long])) => {
           val array = Array(0, 0, 0, 0)
-          array(v._1) = 1
-          (array, v._2)
+          array(c._2) = 1
+          (c._1, array, c._3)
         },
-        (v: (Array[Int], List[Long]), lowOrderAndId: (Byte, List[Long])) => {
-          v._1(lowOrderAndId._1) += 1
-          (v._1, v._2 ++ lowOrderAndId._2)
+        (c: (Int, Array[Int], List[Long]), value: (Int, Byte, List[Long])) => {
+          c._2(value._2) += 1
+          (c._1, c._2, c._3 ++ value._3)
         },
-        (v0: (Array[Int], List[Long]), v1: (Array[Int], List[Long])) => (addArray(v0._1, v1._1), v0._2 ++ v1._2))
+        (v0: (Int, Array[Int], List[Long]), v1: (Int, Array[Int], List[Long])) => (v0._1, addArray(v0._2, v1._2), v0._3 ++ v1._3))
+
+      /** @return 根据需要分成保留组和筛出组，通过判断lowOrderArray里有没有0实现
+        * @note   另一种方法直接分两组，看doc好像比较耗资源
+        *         combineLowOrder.groupBy(_._2._1.contains(0)) */
+      val pickupData = combineLowOrder.filter(_._2._2.exists(_ == 0))
+      val keepData = combineLowOrder.filter(!_._2._2.contains(0))
 
 
-      // 根据需要分成保留组和筛出组
-      val pickupData = combineLowOrder.filter(_._2._1.exists(_ == 0))
-      val keepData = combineLowOrder.filter(!_._2._1.contains(0))
-      /** @note 另一种方法直接分两组，看doc好像比较耗资源
-        *       combineLowOrder.groupBy(_._2._1.contains(0)) */
-
-      // 将highOrder作为key，去除lowOrder信息（应该没用了），其他信息作为value。传给下次迭代
+      /** @return 将highOrder作为key，去除lowOrderArray信息（应该没用了），
+        *         将currentHighestOrder替换成当前i值，其他信息作为value，传给下次迭代 */
       iterativeData = keepData.map {
-        case (highOrder, (_, idList)) => (highOrder, idList)
+        case (highOrder, (_, _, idList)) => (highOrder, (i, idList))
       }
 
-
-      // 当前选出的数据还不能直接拿出去，还得和下一次比对
-      println(s"第${i + 1}级不能聚合的数据，导出${pickupData.aggregate(0)((count, tuple) => count + tuple._2._1.sum, _ + _)}个")
-      pickupData.map(tuple3 => (tuple3._1, tuple3._2._1.toList, tuple3._2._2)).foreach(println)
-      println(s"可以聚合到下一级的数据,${keepData.map(_._2._1.sum).sum()}个")
-      keepData.map(tuple3 => (tuple3._1, tuple3._2._1.toList, tuple3._2._2)).foreach(println)
-      println("==========")
-
-      // 另一种方法
-      // println(s"第${i + 1}级不能聚合的数据，${pickupData.aggregate(0)((count, tuple) => count + tuple._2._1.sum, _ + _)}个")
-      //      pickupData.map(v => ((v._1, i + 1), v._2)).saveAsTextFile(output + (i + 1))
-      //      pickupData.foreach(println)
-      //      println(s"可以聚合到第${i}级的数据，传给下次迭代")
-      //      keepData.foreach(println)
-      //      println("==========")
-      //      count.add(pickupData.map(v => ((v._1, i + 1), v._2)).count())
-
-      //      highOrderData.subtractByKey(keepDataFilter).map(v => ((v._1, i + 1), v._2)).saveAsTextFile(output + (i + 1))
-      //
-      //      iterativeData = highOrderData.subtractByKey(pickupDataFilter) // 用subtractByKey可以直接筛出去
-      //
+      /** @note 一种统计List总数的方法：aggregate */
+      println(s"第${i + 1}级的数据，导出${pickupData.aggregate(0)((count, tuple) => count + tuple._2._3.size, _ + _)}个")
+      pickupData.map(tuple3 => (tuple3._1, tuple3._2._1, tuple3._2._2.toList, tuple3._2._3)).foreach(println)
+      // println(s"可以聚合到下一级的数据${keepData.map(_._2._3.size).sum()}个")
+      // keepData.map(tuple3 => (tuple3._1, tuple3._2._1, tuple3._2._2.toList, tuple3._2._3)).foreach(println)
+      // println("=-=-=-=-=-=")
 
       // 最后一次迭代还要保存留下的数据
       if (i == 0) {
-        println(s"可以聚合到第${i}级的数据，${keepData.map(_._2._1.sum).sum()}个")
-        keepData.map(tuple3 => (tuple3._1, tuple3._2._1.toList, tuple3._2._2)).foreach(println)
-
-        //        count.add(keepData.count())
-        //        keepData.saveAsTextFile(output + i)
-        //        keepData.foreach(println)
+        /** 另一种统计List总数的方法：map 搭配 sum */
+        println(s"第${i}级的数据，导出${keepData.map(_._2._3.size).sum()}个")
+        keepData.map(tuple3 => (tuple3._1, tuple3._2._1, tuple3._2._2.toList, tuple3._2._3)).foreach(println)
       }
-
     }
-    //    sc.wholeTextFiles(output + "*/part-00000*").repartition(1).saveAsTextFile(output + "final")
+
+    // 最后，重新取回所有生成的结果，合并成一个文件保存
+    // sc.wholeTextFiles(output + "*/part-00000*").repartition(1).saveAsTextFile(output + "final")
 
     sc.stop()
   }
@@ -182,17 +167,3 @@ object SmallFootprint {
   }
 
 }
-
-
-/*    /* 网上找的例子
-		* 原始数据：l1
-		* 结果：
-		* ("To", RDD(("Tom",120),("Tod","70"))
-		* ("Ja", RDD(("Jack",120),("James","55"),("Jane",15))
-		* */
-		val l1 = List(("To", List(("Tom", 50), ("Tod", 30), ("Tom", 70), ("Tod", 25), ("Tod", 15))),
-			("Ja", List(("Jack", 50), ("James", 30), ("Jane", 70), ("James", 25), ("Jasper", 15))))
-		sc.parallelize(l1).flatMap { case (key, list) => list.map(item => ((key, item._1), item._2)) }
-			.reduceByKey(_ + _)
-			.map { case ((key, name), hours) => (key, List((name, hours))) }
-			.reduceByKey(_ ++ _)*/
